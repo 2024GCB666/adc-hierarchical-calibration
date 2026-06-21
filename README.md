@@ -2,7 +2,7 @@
 
 Reference implementation for a group-predictive, coarse/fine-decoupled hierarchical digital calibration method for partially interleaved pipelined-SAR ADCs.
 
-The code accompanies the paper draft describing a 2.5-bit Flash/coarse front end, dual-MDAC paths, and four backend SAR channels. It focuses on algorithmic reproducibility: synthetic ADC data generation, hierarchical calibration, FFT/SNDR/SFDR evaluation, NLMS online-update experiments, and figure-generation scripts.
+The code accompanies the paper draft describing a 2.5-bit Flash/coarse front end, dual-MDAC paths, and four backend SAR channels. It focuses on algorithmic reproducibility: synthetic ADC data generation, hierarchical calibration, FFT/SNDR/SFDR evaluation, and NLMS online-update experiments.
 
 ## What is included
 
@@ -20,9 +20,6 @@ The code accompanies the paper draft describing a 2.5-bit Flash/coarse front end
 - `fft_output_code.py`  
   FFT-based SNDR, SFDR, ENOB, and spectrum plotting utilities for output-code data.
 
-- `figures/`  
-  Scripts used to regenerate the behavioral-model figures and source CSV files.
-
 - `scripts/scan_mdac_variance_ratio.py`  
   Timing-skew sweep used to show why long-term fine-code power matching can be biased by coarse/residue branch statistics.
 
@@ -32,7 +29,7 @@ The code accompanies the paper draft describing a 2.5-bit Flash/coarse front end
 - `tests/`  
   Smoke tests for calibration recovery, fractional-delay reference behavior, NLMS convergence, and FFT alias handling.
 
-The proprietary or paper-specific artifacts are intentionally not included: LaTeX source, Word/PDF drafts, reference papers, large generated TIFF/PDF figure exports, and private post-layout raw data.
+The proprietary or paper-specific artifacts are intentionally not included: LaTeX source, Word/PDF drafts, reference papers, paper figure-generation scripts, large generated TIFF/PDF figure exports, and private post-layout raw data.
 
 ## Install
 
@@ -61,20 +58,6 @@ For the NLMS adaptive-update variant:
 ```bash
 python calibration.py --reference-method known_tone --inter-method nlms --lms-mu 0.005 --lms-epochs 1
 ```
-
-## Regenerate figure data and plots
-
-Run individual scripts from the repository root:
-
-```bash
-python figures/make_fig2_mdac_variance_ratio.py
-python figures/make_fig4_behavioral_spectrum.py
-python figures/make_fig5_frequency_sweep.py
-python figures/make_fig6_nlms_convergence.py
-python figures/make_fig8_behavioral_512_spectrum.py
-```
-
-These scripts write generated `.csv`, `.png`, `.svg`, `.pdf`, and `.tiff` files into `figures/`. Generated outputs are ignored by Git by default.
 
 ## Optional web UI
 
