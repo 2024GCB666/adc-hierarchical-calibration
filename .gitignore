@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Generated outputs
+outputs/
+*.npz
+*.npy
+
+# Generated figure artifacts. Keep scripts, ignore regenerated data/plots.
+figures/fig*.csv
+figures/fig*.png
+figures/fig*.svg
+figures/fig*.pdf
+figures/fig*.tiff
+figures/fig*.drawio
+
+# Local/editor files
+.DS_Store
+Thumbs.db
+*.log
+*.aux
+*.tmp
+~$*
