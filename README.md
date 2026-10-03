@@ -15,10 +15,10 @@ The method aligns backend SAR fine codes within each MDAC group, predicts the ta
 | `scripts/scan_mdac_variance_ratio.py` | Redundant-residue power-estimation bias and the four aligned target-construction alternatives |
 | `scripts/run_mode_b_timing_validation.py` | Five-seed physical cold-start validation for multitone, band-limited random and 16-QAM DMT inputs |
 | `scripts/run_mode_b_tracking_validation.py` | Abrupt gain/offset/aperture-skew step and reacquisition without reinitialization |
-| `scripts/validate_cadence_adc.py` | Numerical post-layout validation using a user-supplied Cadence CSV |
+| `scripts/validate_cadence_adc.py` | Numerical post-layout validation using Cadence-exported CSV data |
 | `tests/` | Regression checks for calibration recovery, NLMS update order, derivative units and FFT/group alignment |
 
-Only source code, documentation, dependency metadata and the MIT license are distributed. ADC output-code records, post-layout datasets, generated results, manuscript files, figures, plotting code and a browser UI are not included. Synthetic verification records are generated in memory when a validation script runs. The scripts print numerical summaries as JSON and do not write ADC-code or figure files.
+The validation scripts generate synthetic records in memory and print numerical summaries as JSON.
 
 ## Install and test
 
@@ -29,7 +29,7 @@ python -m pip install -r requirements.txt
 python -m pytest
 ```
 
-The only dependencies are NumPy and pytest; no plotting or web framework is required.
+The dependencies are NumPy and pytest.
 
 ## Reproduce the numerical experiments
 
@@ -65,15 +65,15 @@ corrected, coefficients, diagnostics, metrics = calibrate_adc(
 
 `D_coarse` and `F_raw` are one-dimensional arrays in common final-output LSB units, and `sar_id` identifies channels 0..3. In the verification architecture, ch0/ch2 share MDAC-A and ch1/ch3 share MDAC-B. The synthetic ideal code and injected mismatch truth are evaluation metadata, not calibration inputs. `calibrate_adc_background` exposes the fixed-scale NLMS array flow; `run_background_nlms_stream` exposes the sample-ordered adaptive update kernel.
 
-For your own exported post-layout record:
+For Cadence-exported post-layout records:
 
 ```bash
 python scripts/validate_cadence_adc.py --input /path/to/your_adc_export.csv --fs 1e9 --fin 401733398.4375 --window-samples 8192 --inject-preset sar_pair_mismatch
 ```
 
-The adapter expects CSV fields `sample_idx`, `time`, `valid`, `b11` through `b0`, `flash_u`, `sar_u`, `sar_eff`, `F_raw`, `D_coarse`, `D_raw` and `AC`. It reconstructs the redundant backend SAR with weights `[128, 64, 32, 32, 16, 8, 4, 2, 1]`, checks the exported reconstruction, selects a valid record window and evaluates raw/intra-group/full-calibration stages. Controlled injection changes only the fine-code path. Foundry-derived or post-layout raw records must be supplied by the user and are not distributed here; synthetic runs do not reproduce circuit-generated settling and residue distributions.
+The adapter expects CSV fields `sample_idx`, `time`, `valid`, `b11` through `b0`, `flash_u`, `sar_u`, `sar_eff`, `F_raw`, `D_coarse`, `D_raw` and `AC`. It reconstructs the redundant backend SAR with weights `[128, 64, 32, 32, 16, 8, 4, 2, 1]`, checks the exported reconstruction, selects a valid record window and evaluates raw/intra-group/full-calibration stages. Controlled injection changes only the fine-code path. Synthetic validation models differ from circuit-generated post-layout residue and settling behavior.
 
-Standalone numerical FFT analysis also requires your own record:
+For numerical FFT analysis:
 
 ```bash
 python fft_output_code.py /path/to/your_codes.csv --column D_raw --fs 1e9 --fin 401733398.4375
