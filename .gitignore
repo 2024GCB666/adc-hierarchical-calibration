@@ -1,25 +1,33 @@
-# Python
+# Python and local environments
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
 .venv/
 venv/
-env/
+.env
 
-# Generated outputs
+# Generated data and reports: do not bundle ADC records.
 outputs/
+data/
+*.csv
 *.npz
 *.npy
+*.json
+*.jsonl
 
-# Generated figure artifacts. Keep scripts, ignore regenerated data/plots.
-figures/fig*.csv
-figures/fig*.png
-figures/fig*.svg
-figures/fig*.pdf
-figures/fig*.tiff
-figures/fig*.drawio
+# Figures and manuscript artifacts
+figures/
+*.png
+*.svg
+*.pdf
+*.tif
+*.tiff
+*.jpg
+*.drawio
+*.tex
+*.bib
+*.docx
+*.zip
 
 # Local/editor files
 .DS_Store
@@ -27,4 +35,3 @@ Thumbs.db
 *.log
 *.aux
 *.tmp
-~$*

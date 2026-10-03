@@ -1,8 +1,7 @@
-"""FFT metrics and spectrum plot for ADC output-code data.
+"""Numerical FFT, SNDR, SFDR and ENOB evaluation, without plotting.
 
-Examples:
-    python fft_output_code.py outputs/adc_synthetic_modeling_data_mdac4_30ps_50ps_fixed.npz
-    python fft_output_code.py outputs/adc_synthetic_modeling_data_mdac4_30ps_50ps_fixed.csv --column D_raw --fs 1e9 --fin 73.123e6
+The command-line entry point reads a user-supplied CSV or NPZ record and
+prints metrics as JSON. No default dataset or generated spectrum is bundled.
 """
 
 from __future__ import annotations
@@ -196,104 +195,6 @@ def compute_fft_metrics(
     return metrics, debug
 
 
-def plot_spectrum(
-    debug: dict[str, np.ndarray],
-    metrics: dict[str, Any],
-    output_path: Path | IO[bytes],
-    title: str,
-    floor_db: float = -160.0,
-) -> None:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    freq_mhz = debug["freq"] / 1e6
-    spectrum_dbc = debug["bin_power_dbc"]
-    
-    # Adaptive lower threshold calculation
-    min_dbc = np.min(spectrum_dbc)
-    p05_dbc = np.percentile(spectrum_dbc, 5)
-    max_dbc = np.max(spectrum_dbc)
-    
-    # Base the floor on the 5th percentile to ignore deep numerical nulls
-    adaptive_floor = np.floor((p05_dbc - 10) / 10) * 10
-    # Ensure minimum dynamic range of 100 dB, but don't clip below -200 for ideal ADCs
-    adaptive_floor = min(adaptive_floor, np.floor((max_dbc - 100) / 10) * 10)
-    adaptive_floor = max(adaptive_floor, -200.0)
-    
-    # Overwrite floor_db with the adaptive one
-    floor_db = adaptive_floor
-    spectrum_display = np.maximum(spectrum_dbc, floor_db)
-
-    plt.figure(figsize=(11, 6))
-    plt.vlines(
-        freq_mhz,
-        floor_db,
-        spectrum_display,
-        linewidth=0.8,
-        color="tab:blue",
-        alpha=0.85,
-    )
-    # Add dots so every bin is explicitly visible (e.g. at the bottom axis if clipped)
-    plt.scatter(
-        freq_mhz,
-        spectrum_display,
-        s=4,
-        color="tab:blue",
-        alpha=0.85,
-        zorder=3,
-        edgecolors="none",
-    )
-    fund_idx = metrics["fundamental_bin"]
-    spur_idx = metrics["largest_spur_bin"]
-    plt.plot(
-        freq_mhz[fund_idx],
-        spectrum_dbc[fund_idx],
-        marker="o",
-        markersize=10,
-        markeredgecolor="tab:green",
-        markerfacecolor="none",
-        linestyle="none",
-        label="Fundamental",
-    )
-    plt.plot(
-        freq_mhz[spur_idx],
-        spectrum_dbc[spur_idx],
-        marker="o",
-        markersize=10,
-        markeredgecolor="tab:red",
-        markerfacecolor="none",
-        linestyle="none",
-        label="Largest spur",
-    )
-    plt.title(title)
-    plt.xlabel("Frequency (MHz)")
-    plt.ylabel("Power / Fundamental (dBc/bin)")
-    plt.grid(True, alpha=0.35)
-    plt.ylim(floor_db, 10)
-    plt.xlim(0, float(freq_mhz[-1]))
-    plt.legend(loc="upper right")
-    text = (
-        f"SNDR/SNFR = {metrics['SNDR_dB']:.2f} dB\n"
-        f"SFDR = {metrics['SFDR_dBc_single_bin']:.2f} dBc\n"
-        f"ENOB = {metrics['ENOB_bits']:.2f} bit\n"
-        f"{metrics['window']}"
-    )
-    plt.text(
-        0.985,
-        0.82,
-        text,
-        transform=plt.gca().transAxes,
-        ha="right",
-        va="top",
-        bbox={"facecolor": "white", "edgecolor": "lightgray", "alpha": 0.85},
-    )
-    plt.tight_layout()
-    if hasattr(output_path, "parent"):
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=160)
-    plt.close()
 
 
 def json_ready(obj: Any) -> Any:
@@ -308,115 +209,25 @@ def json_ready(obj: Any) -> Any:
     return obj
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="FFT analysis for ADC output code.")
-    parser.add_argument(
-        "input",
-        type=Path,
-        nargs="?",
-        default=None,
-        help=(
-            "Input .npz or .csv file. If omitted, analyze the default "
-            "nomismatch and mismatch NPZ files from model.py."
-        ),
-    )
-    parser.add_argument("--column", default="D_raw", help="Output code column/key.")
-    parser.add_argument("--fs", type=float, default=None, help="Sample rate in Hz.")
-    parser.add_argument("--fin", type=float, default=None, help="Tone frequency in Hz.")
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("outputs") / "fft",
-        help="Directory for PNG and JSON outputs.",
-    )
-    parser.add_argument(
-        "--window",
-        choices=["auto", "blackman_harris", "rectangular"],
-        default="blackman_harris",
-        help=(
-            "FFT window. 'auto' uses rectangular for coherent tones and "
-            "Blackman-Harris otherwise."
-        ),
-    )
-    parser.add_argument("--signal-half-width", type=int, default=4)
-    parser.add_argument("--guard-half-width", type=int, default=8)
-    parser.add_argument("--spur-half-width", type=int, default=2)
-    return parser.parse_args()
 
 
-def analyze_one(args: argparse.Namespace, input_path: Path) -> dict[str, Any]:
-    y, fs, fin = load_output_code(input_path, args.column, args.fs, args.fin)
-    metrics, debug = compute_fft_metrics(
-        y,
-        fs=fs,
-        fin=fin,
-        window=args.window,
-        signal_half_width=args.signal_half_width,
-        guard_half_width=args.guard_half_width,
-        spur_half_width=args.spur_half_width,
-    )
 
-    stem = f"{input_path.stem}_{args.column}_fft"
-    png_path = args.output_dir / f"{stem}.png"
-    json_path = args.output_dir / f"{stem}_metrics.json"
-    plot_spectrum(
-        debug,
-        metrics,
-        png_path,
-        title=f"FFT Spectrum: {input_path.name} [{args.column}]",
-    )
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(
-        json.dumps(json_ready(metrics), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
 
-    print(f"Input: {input_path}")
-    print(f"Column: {args.column}")
-    print(f"Spectrum PNG: {png_path}")
-    print(f"Metrics JSON: {json_path}")
-    print(f"SNDR/SNFR: {metrics['SNDR_dB']:.3f} dB")
-    print(f"SFDR single-bin: {metrics['SFDR_dBc_single_bin']:.3f} dBc")
-    print(f"SFDR integrated: {metrics['SFDR_dBc_integrated']:.3f} dBc")
-    print(f"ENOB: {metrics['ENOB_bits']:.3f} bits")
-    print(f"Largest spur: {metrics['largest_spur_freq_Hz'] / 1e6:.6f} MHz")
-    return {
-        "input": str(input_path),
-        "png": str(png_path),
-        "json": str(json_path),
-        "metrics": metrics,
-    }
+
+
 
 
 def main() -> None:
-    args = parse_args()
-    if args.input is None:
-        inputs = [
-            Path("outputs") / "adc_synthetic_modeling_data_nomismatch.npz",
-            Path("outputs") / "adc_synthetic_modeling_data_mismatch.npz",
-        ]
-    else:
-        inputs = [args.input]
-
-    results = []
-    for index, input_path in enumerate(inputs):
-        if not input_path.exists():
-            raise FileNotFoundError(
-                f"{input_path} does not exist. Run model.py first or pass an input file."
-            )
-        if index:
-            print("")
-        results.append(analyze_one(args, input_path))
-
-    if len(results) > 1:
-        summary_path = args.output_dir / f"default_{args.column}_fft_compare_metrics.json"
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(
-            json.dumps(json_ready(results), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        print("")
-        print(f"Comparison JSON: {summary_path}")
+    parser = argparse.ArgumentParser(description="Numerical ADC FFT metrics.")
+    parser.add_argument("input", type=Path, help="User-supplied CSV or NPZ file.")
+    parser.add_argument("--column", default="D_raw")
+    parser.add_argument("--fs", type=float)
+    parser.add_argument("--fin", type=float)
+    parser.add_argument("--window", choices=("auto", "rectangular", "blackman_harris"), default="auto")
+    args = parser.parse_args()
+    values, fs, fin = load_output_code(args.input, args.column, args.fs, args.fin)
+    metrics, _ = compute_fft_metrics(values, fs=fs, fin=fin, window=args.window)
+    print(json.dumps(json_ready(metrics), indent=2))
 
 
 if __name__ == "__main__":

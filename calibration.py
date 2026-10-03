@@ -1,20 +1,14 @@
-"""针对合成架构模型的分层ADC校准。
+"""Coarse/fine-decoupled hierarchical calibration for PI pipelined-SAR ADCs.
 
-校准流程遵循
-``ADC分层校准算法_架构建模与合成数据验证规格(2).md``：
-
-1. 组内（Intra-group）SAR校准：ch2对齐到ch0，ch3对齐到ch1。
-2. 从校准后的fine code中提取并构建A/B两组MDAC数据流。
-3. 从A组数据流预测B组的理想总码字（Dhat_B）。
-4. 使用最小二乘法估计B组的fine增益、偏移以及类似时序（timing-like）的失配项。
-5. 将校准后的A/B数据流重新交织回全速（full rate）。
-
-仅面向架构的数组用于参数估计。合成的 ``D_ideal`` 和 ``truth`` 元数据仅用于校准效果的验证。
+The fine-code domain is aligned within each MDAC group, then the calibrated
+A-group predicts the B total code. Subtracting B-local coarse code constructs
+the target for foreground LS (Mode A) or fixed-scale, sample-ordered NLMS
+(Mode B). Synthetic ideal codes and mismatch truth are used only to evaluate
+results; they are not estimator inputs.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 from dataclasses import asdict, dataclass, replace
@@ -24,14 +18,7 @@ from typing import Any, Literal
 import numpy as np
 
 from fft_output_code import compute_fft_metrics
-from model import (
-    DatasetConfig,
-    MismatchConfig,
-    SignalConfig,
-    TimingConfig,
-    build_synthetic_adc_dataset,
-    timing_case,
-)
+
 
 
 Array = np.ndarray
@@ -58,6 +45,18 @@ class CalibrationConfig:
     lms_eps: float = 1e-9
     lms_trace_block_size: int = 1024
     lms_settling_ratio: float = 1.1
+    # Mode-B NLMS uses deterministic engineering scales rather than statistics
+    # estimated from the record.  ``None`` selects the signed fine-code full
+    # scale, 2**(N_fine-1), which is known from the ADC architecture.
+    lms_feature_scale_fine: float | None = None
+    lms_feature_scale_slope: float | None = None
+    # Physical cold-start state.  These defaults require no training block.
+    lms_initial_g_B: float = 1.0
+    lms_initial_o_B: float = 0.0
+    lms_initial_k_B: float = 0.0
+    # Mode B defaults to the physically scaled derivative reported in the
+    # paper.  Set this to zero only to reproduce the legacy centered basis.
+    differentiator_taps: int = 31
 
 
 def _as_float_array(values: Array) -> Array:
@@ -123,6 +122,13 @@ def _standardize_on_mask(values: Array, mask: Array) -> tuple[Array, float, floa
     if not math.isfinite(scale) or scale == 0.0:
         scale = 1.0
     return (values - center) / scale, center, scale
+
+
+def _positive_feature_scale(value: float | None, default: float, name: str) -> float:
+    scale = float(default if value is None else value)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"{name} must be a positive finite value.")
+    return scale
 
 
 def calibrate_pair_by_stats(reference: Array, target: Array) -> tuple[float, float]:
@@ -399,6 +405,71 @@ def _centered_difference(values: Array) -> Array:
     return diff
 
 
+def build_fir_differentiator(num_taps: int) -> Array:
+    """Return an odd, Blackman-windowed FIR differentiator.
+
+    The coefficients approximate ``d x[k] / d k``.  They are normalized by
+    their first moment so that a discrete-time ramp has exactly unit slope;
+    this also makes the derivative unit explicit and testable.
+    """
+    if num_taps < 5 or num_taps % 2 == 0:
+        raise ValueError("FIR differentiator must have an odd number of taps >= 5.")
+    n = np.arange(-(num_taps // 2), num_taps // 2 + 1, dtype=np.float64)
+    h = np.zeros_like(n, dtype=np.float64)
+    mask = n != 0
+    h[mask] = np.cos(np.pi * n[mask]) / n[mask]
+    h *= np.blackman(num_taps)
+    first_moment = float(np.dot(n, h))
+    if not math.isfinite(first_moment) or abs(first_moment) < 1e-12:
+        raise ValueError("FIR differentiator has an invalid first moment.")
+    # np.convolve reverses h, hence a unit ramp produces -sum(n*h).
+    return h / (-first_moment)
+
+
+def apply_fir_differentiator(values: Array, h: Array) -> Array:
+    """Apply a centered FIR differentiator and mark unsupported edges NaN."""
+    values = _as_float_array(values)
+    h = _as_float_array(h)
+    num_taps = h.size
+    if num_taps < 5 or num_taps % 2 == 0:
+        raise ValueError("Differentiator coefficients must have odd length >= 5.")
+    pad = num_taps // 2
+    diff = np.full(values.size, np.nan, dtype=np.float64)
+    if values.size >= num_taps:
+        diff[pad:-pad] = np.convolve(values, h, mode="valid")
+    return diff
+
+
+def _interpolation_slope_basis(
+    Dhat_B: Array,
+    differentiator_taps: int,
+) -> tuple[Array, dict[str, Any]]:
+    """Build a Mode-B slope basis in LSB per full-rate sample."""
+    if differentiator_taps > 0:
+        h_diff = build_fir_differentiator(differentiator_taps)
+        # Adjacent B predictions are two full-rate samples apart.  The FIR
+        # derivative is initially in LSB/A-sample, so divide by two.
+        slope_raw = apply_fir_differentiator(Dhat_B, h_diff) / 2.0
+        delay_a = differentiator_taps // 2
+        return slope_raw, {
+            "slope_method": "blackman_fir_differentiator",
+            "slope_unit": "LSB/full-rate-sample",
+            "slope_basis_factor": 1.0,
+            "differentiator_taps": int(differentiator_taps),
+            "differentiator_coefficients": h_diff,
+            "differentiator_group_delay_A_samples": int(delay_a),
+            "differentiator_group_delay_full_rate_samples": int(2 * delay_a),
+        }
+
+    slope_raw = _centered_difference(Dhat_B)
+    return slope_raw, {
+        "slope_method": "legacy_centered_predictor_difference",
+        "slope_unit": "LSB/centered-two-A-sample-difference",
+        "differentiator_group_delay_A_samples": 1,
+        "differentiator_group_delay_full_rate_samples": 2,
+    }
+
+
 def build_B_reference(
     group: dict[str, Array],
     fs: float | None,
@@ -410,7 +481,10 @@ def build_B_reference(
     info: dict[str, Any] = {"reference_method": cfg.reference_method}
     if cfg.reference_method == "linear":
         Dhat_B, mask_ref, h = linear_predict_B_from_A(group["U_A"])
-        slope_raw = _centered_difference(Dhat_B)
+        slope_raw, slope_info = _interpolation_slope_basis(
+            Dhat_B, cfg.differentiator_taps
+        )
+        info.update(slope_info)
         info["fir_coefficients"] = h
     elif cfg.reference_method == "fractional_delay_fir":
         _, h, fir_info = _resolve_fractional_delay_fir(
@@ -421,8 +495,19 @@ def build_B_reference(
         )
         Dhat_B, mask_ref = _apply_fractional_delay_fir(group["U_A"], h)
         info.update(fir_info)
-        slope_raw = _centered_difference(Dhat_B)
+        slope_raw, slope_info = _interpolation_slope_basis(
+            Dhat_B, cfg.differentiator_taps
+        )
+        info.update(slope_info)
         info["fir_coefficients"] = h
+        predictor_delay_a = int(info["fir_effective_taps"]) // 2
+        slope_delay_a = int(info["differentiator_group_delay_A_samples"])
+        info["predictor_group_delay_A_samples"] = predictor_delay_a
+        info["predictor_group_delay_full_rate_samples"] = 2 * predictor_delay_a
+        info["total_group_delay_A_samples"] = predictor_delay_a + slope_delay_a
+        info["total_group_delay_full_rate_samples"] = 2 * (
+            predictor_delay_a + slope_delay_a
+        )
     elif cfg.reference_method == "known_tone":
         if fs is None or fin is None:
             raise ValueError("known_tone reference requires fs and fin.")
@@ -436,12 +521,29 @@ def build_B_reference(
         mask_ref = np.isfinite(Dhat_B) & np.isfinite(slope_raw)
         info.update(tone_info)
         info["known_tone_source"] = cfg.known_tone_source
+        info["slope_method"] = "known_tone_analytic_derivative"
+        info["slope_unit"] = "LSB/full-rate-sample"
+        info["slope_basis_factor"] = 1.0
     else:
         raise ValueError(f"Unsupported reference method {cfg.reference_method!r}.")
 
     Fhat_B = Dhat_B - group["D_coarse_B"]
     pre_mask = mask_ref & np.isfinite(Fhat_B) & np.isfinite(group["F_B"])
-    slope_B, slope_center, slope_scale = _standardize_on_mask(slope_raw, pre_mask)
+    if cfg.inter_method == "nlms":
+        # A background loop must not estimate normalization statistics from
+        # future samples in the record.  Use an architecture-known fixed scale
+        # and zero center so the first valid sample can be processed online.
+        slope_center = 0.0
+        slope_scale = _positive_feature_scale(
+            cfg.lms_feature_scale_slope,
+            float(2 ** (cfg.N_fine - 1)),
+            "lms_feature_scale_slope",
+        )
+        slope_B = slope_raw / slope_scale
+        info["slope_normalization"] = "fixed_engineering_scale"
+    else:
+        slope_B, slope_center, slope_scale = _standardize_on_mask(slope_raw, pre_mask)
+        info["slope_normalization"] = "record_statistics"
     info["slope_center"] = slope_center
     info["slope_scale"] = slope_scale
     return Dhat_B, Fhat_B, slope_B, mask_ref, info
@@ -523,6 +625,133 @@ def estimate_joint_ls(
     return coeffs, diagnostics, residual
 
 
+def run_background_nlms_stream(
+    F_B: Array,
+    Fhat_B: Array,
+    slope_B: Array,
+    mask_safe: Array,
+    *,
+    mu: float = 0.005,
+    eps: float = 1e-9,
+    fine_scale: float = 128.0,
+    initial_g_B: float = 1.0,
+    initial_o_B: float = 0.0,
+    initial_k_B: float = 0.0,
+    trace_block_size: int = 256,
+) -> tuple[Array, dict[str, float], dict[str, Any]]:
+    """Run one strictly sample-ordered Mode-B NLMS pass.
+
+    ``F_B`` and ``slope_B`` are the measured fine code and the already scaled
+    slope feature used by the correction model
+
+    ``F_corr = g_B * F_B + o_B + k_B * slope_B``.
+
+    The fine-code feature is divided by the deterministic ``fine_scale``.  No
+    means, variances, or least-squares coefficients are estimated internally.
+    For each safe sample, the returned online correction is formed from the
+    *pre-update* state and only then is that sample used to update the state.
+    This ordering makes the function suitable for cold-start and tracking
+    experiments without look-ahead leakage.
+    """
+
+    F_B = _as_float_array(F_B)
+    Fhat_B = _as_float_array(Fhat_B)
+    slope_B = _as_float_array(slope_B)
+    mask_safe = np.asarray(mask_safe, dtype=bool)
+    if not (F_B.shape == Fhat_B.shape == slope_B.shape == mask_safe.shape):
+        raise ValueError("Mode-B NLMS inputs must have identical shapes.")
+    if not math.isfinite(mu) or mu <= 0.0 or mu >= 2.0:
+        raise ValueError("mu must satisfy 0 < mu < 2 for NLMS.")
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("eps must be a positive finite value.")
+    fine_scale = _positive_feature_scale(fine_scale, 1.0, "fine_scale")
+    if trace_block_size < 1:
+        raise ValueError("trace_block_size must be >= 1.")
+    initial = np.asarray(
+        [initial_g_B, initial_o_B, initial_k_B], dtype=np.float64
+    )
+    if not np.all(np.isfinite(initial)):
+        raise ValueError("Initial Mode-B NLMS coefficients must be finite.")
+
+    # theta[0] multiplies F_B/fine_scale; theta[1:3] retain the physical
+    # offset and scaled-slope coefficient units used in the paper.
+    theta = np.asarray(
+        [initial_g_B * fine_scale, initial_o_B, initial_k_B],
+        dtype=np.float64,
+    )
+    corrected_online = F_B.copy()
+    residual_online = np.full(F_B.size, np.nan, dtype=np.float64)
+    block_trace: list[dict[str, Any]] = []
+    block_errors: list[float] = []
+    updates = 0
+
+    def append_trace(sample_idx: int) -> None:
+        if not block_errors:
+            return
+        err = np.asarray(block_errors, dtype=np.float64)
+        block_trace.append(
+            {
+                "update_count": int(updates),
+                "sample_index_B": int(sample_idx),
+                "block_rms_res_B": _rms(err),
+                "g_B": float(theta[0] / fine_scale),
+                "o_B": float(theta[1]),
+                "k_B": float(theta[2]),
+            }
+        )
+        block_errors.clear()
+
+    for idx in range(F_B.size):
+        phi = np.asarray([F_B[idx] / fine_scale, 1.0, slope_B[idx]])
+        if not np.all(np.isfinite(phi)):
+            continue
+        prediction = float(np.dot(theta, phi))
+        corrected_online[idx] = prediction
+        if not mask_safe[idx] or not math.isfinite(Fhat_B[idx]):
+            continue
+        error = float(Fhat_B[idx] - prediction)
+        residual_online[idx] = error
+        theta += (mu * error / (eps + float(np.dot(phi, phi)))) * phi
+        updates += 1
+        block_errors.append(error)
+        if updates % trace_block_size == 0:
+            append_trace(int(idx))
+
+    if block_errors:
+        safe_indices = np.flatnonzero(mask_safe)
+        append_trace(int(safe_indices[-1]) if safe_indices.size else -1)
+
+    coeffs = {
+        "g_B": float(theta[0] / fine_scale),
+        "o_B": float(theta[1]),
+        "k_B": float(theta[2]),
+    }
+    final_model_residual = Fhat_B - (
+        coeffs["g_B"] * F_B + coeffs["o_B"] + coeffs["k_B"] * slope_B
+    )
+    valid_online = np.isfinite(residual_online)
+    diagnostics = {
+        "adaptive_method": "sample_ordered_nlms",
+        "initialization": "explicit_state_no_data_fit",
+        "apply_then_update": True,
+        "mu": float(mu),
+        "eps": float(eps),
+        "fine_scale": float(fine_scale),
+        "update_count": int(updates),
+        "block_trace": block_trace,
+        "online_rms_res_B": (
+            _rms(residual_online[valid_online]) if np.any(valid_online) else None
+        ),
+        "final_model_rms_res_B": (
+            _rms(final_model_residual[mask_safe]) if np.any(mask_safe) else None
+        ),
+        "initial_g_B": float(initial_g_B),
+        "initial_o_B": float(initial_o_B),
+        "initial_k_B": float(initial_k_B),
+    }
+    return corrected_online, coeffs, diagnostics
+
+
 def estimate_inter_group_B_nlms(
     F_B: Array,
     Fhat_B: Array,
@@ -554,11 +783,20 @@ def estimate_inter_group_B_nlms(
     if not math.isfinite(settling_ratio) or settling_ratio < 1.0:
         raise ValueError("lms_settling_ratio must be >= 1.0.")
 
-    f_scale = float(np.std(F_B[mask_safe]))
-    if not math.isfinite(f_scale) or f_scale == 0.0:
-        f_scale = 1.0
-
-    theta = np.asarray([f_scale, 0.0, 0.0], dtype=np.float64)
+    f_scale = _positive_feature_scale(
+        cfg.lms_feature_scale_fine,
+        float(2 ** (cfg.N_fine - 1)),
+        "lms_feature_scale_fine",
+    )
+    initial = np.asarray(
+        [cfg.lms_initial_g_B, cfg.lms_initial_o_B, cfg.lms_initial_k_B],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(initial)):
+        raise ValueError("Initial Mode-B NLMS coefficients must be finite.")
+    theta = np.asarray(
+        [initial[0] * f_scale, initial[1], initial[2]], dtype=np.float64
+    )
     update_indices = np.flatnonzero(mask_safe)
     block_trace: list[dict[str, Any]] = []
     epoch_rms_trace: list[float] = []
@@ -635,6 +873,11 @@ def estimate_inter_group_B_nlms(
 
     diagnostics = {
         "adaptive_method": "nlms",
+        "initialization": "explicit_state_no_data_fit",
+        "normalization": "fixed_engineering_scale",
+        "lms_initial_g_B": float(initial[0]),
+        "lms_initial_o_B": float(initial[1]),
+        "lms_initial_k_B": float(initial[2]),
         "lms_mu": mu,
         "lms_epochs": epochs,
         "lms_eps": eps,
@@ -816,7 +1059,9 @@ def build_timing_mismatch_comparison(
     fs_v = _finite_or_none(fs)
     k_b = _finite_or_none(coeffs.get("k_B"))
     slope_scale = _finite_or_none(reference_info.get("slope_scale"))
-    basis_factor = timing_slope_basis_factor(reference_method, fs, fin)
+    basis_factor = _finite_or_none(reference_info.get("slope_basis_factor"))
+    if basis_factor is None:
+        basis_factor = timing_slope_basis_factor(reference_method, fs, fin)
 
     actual_b_minus_a_s = None
     if dt_a is not None and dt_b is not None:
@@ -930,11 +1175,40 @@ def calibrate_adc(
 
     coeffs = {**intra_coeffs, **inter_coeffs}
     slope_for_apply = np.nan_to_num(slope_B, nan=0.0, posinf=0.0, neginf=0.0)
-    F_B_corr = (
-        inter_coeffs["g_B"] * group["F_B"]
-        + inter_coeffs["o_B"]
-        + inter_coeffs["k_B"] * slope_for_apply
-    )
+    if cfg.inter_method == "nlms" and cfg.lms_epochs == 1:
+        # Return the realizable background waveform: sample k is corrected
+        # from the pre-update state, then its error updates state k+1.  The
+        # final state is never back-applied to earlier samples.
+        F_B_corr, stream_coeffs, stream_diag = run_background_nlms_stream(
+            group["F_B"],
+            Fhat_B,
+            slope_B,
+            mask_safe,
+            mu=cfg.lms_mu,
+            eps=cfg.lms_eps,
+            fine_scale=_positive_feature_scale(
+                cfg.lms_feature_scale_fine,
+                float(2 ** (cfg.N_fine - 1)),
+                "lms_feature_scale_fine",
+            ),
+            initial_g_B=cfg.lms_initial_g_B,
+            initial_o_B=cfg.lms_initial_o_B,
+            initial_k_B=cfg.lms_initial_k_B,
+            trace_block_size=cfg.lms_trace_block_size,
+        )
+        inter_coeffs = stream_coeffs
+        coeffs = {**intra_coeffs, **inter_coeffs}
+        inter_diag["prequential_output"] = {
+            key: value
+            for key, value in stream_diag.items()
+            if key != "block_trace"
+        }
+    else:
+        F_B_corr = (
+            inter_coeffs["g_B"] * group["F_B"]
+            + inter_coeffs["o_B"]
+            + inter_coeffs["k_B"] * slope_for_apply
+        )
     U_B_corr = group["D_coarse_B"] + F_B_corr
     D_corr = np.empty(N, dtype=np.float64)
     D_corr[0::2] = group["U_A"]
@@ -964,6 +1238,15 @@ def calibrate_adc(
         "fir_response_error_effective",
         "fir_response_error_target",
         "fir_normalized_frequency_to_A_fs",
+        "slope_method",
+        "slope_unit",
+        "slope_basis_factor",
+        "predictor_group_delay_A_samples",
+        "predictor_group_delay_full_rate_samples",
+        "differentiator_group_delay_A_samples",
+        "differentiator_group_delay_full_rate_samples",
+        "total_group_delay_A_samples",
+        "total_group_delay_full_rate_samples",
     ):
         if key in ref_info:
             config_payload[key] = ref_info[key]
@@ -999,10 +1282,15 @@ def calibrate_adc(
     }
     if D_ideal is not None:
         D_ideal = _as_float_array(D_ideal)
+        tail = slice(3 * N // 4, N)
         metrics["error_vs_ideal"] = {
             "rms_raw_lsb": _rms(D_raw - D_ideal),
             "rms_after_intra_lsb": _rms(D_after_intra - D_ideal),
             "rms_after_full_lsb": _rms(D_corr - D_ideal),
+            "rms_raw_tail_quarter_lsb": _rms((D_raw - D_ideal)[tail]),
+            "rms_after_full_tail_quarter_lsb": _rms(
+                (D_corr - D_ideal)[tail]
+            ),
             "mean_raw_lsb": float(np.mean(D_raw - D_ideal)),
             "mean_after_full_lsb": float(np.mean(D_corr - D_ideal)),
         }
@@ -1051,53 +1339,6 @@ def load_npz_dataset(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return data, truth
 
 
-def build_demo_dataset(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
-    fs = float(args.fs)
-    fin = float(args.fin) if args.fin is not None else args.tone_bin / args.N * fs
-    base_timing = timing_case(args.timing_case)
-    timing = base_timing
-    if args.dt_mdac_A_ps is not None or args.dt_mdac_B_ps is not None:
-        timing = TimingConfig(
-            dt_flash_common=base_timing.dt_flash_common,
-            dt_mdac_A=(
-                float(args.dt_mdac_A_ps) * 1e-12
-                if args.dt_mdac_A_ps is not None
-                else base_timing.dt_mdac_A
-            ),
-            dt_mdac_B=(
-                float(args.dt_mdac_B_ps) * 1e-12
-                if args.dt_mdac_B_ps is not None
-                else base_timing.dt_mdac_B
-            ),
-            dt_sar=base_timing.dt_sar,
-        )
-    signal = SignalConfig(
-        fs=fs,
-        fin=fin,
-        amplitude=float(args.amplitude),
-        phase=float(args.phase),
-        dc=0.0,
-    )
-    mismatch = MismatchConfig(
-        g0=float(args.g0),
-        o0=float(args.o0),
-        g1=float(args.g1),
-        o1=float(args.o1),
-        g2=float(args.g2),
-        o2=float(args.o2),
-        g3=float(args.g3),
-        o3=float(args.o3),
-        noise_std=float(args.noise_std),
-    )
-    cfg = DatasetConfig(
-        N=int(args.N),
-        seed=int(args.seed),
-        signal=signal,
-        timing=timing,
-        mismatch=mismatch,
-    )
-    data, truth, _ = build_synthetic_adc_dataset(cfg)
-    return data, truth
 
 
 def add_fft_metrics(
@@ -1121,476 +1362,3 @@ def add_fft_metrics(
             window="auto",
         )
     metrics["fft"] = fft_metrics
-
-
-def _fmt_table_value(value: Any, digits: int = 6) -> str:
-    if value is None:
-        return "-"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, str):
-        return value
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    if not math.isfinite(v):
-        return "-"
-    if v == 0.0:
-        return "0"
-    abs_v = abs(v)
-    if 1e-3 <= abs_v < 1e5:
-        return f"{v:.{digits}f}".rstrip("0").rstrip(".")
-    return f"{v:.{digits}e}"
-
-
-def _markdown_table(headers: list[str], rows: list[list[Any]]) -> str:
-    rendered_rows = [[_fmt_table_value(cell) for cell in row] for row in rows]
-    widths = [
-        max(len(headers[col]), *(len(row[col]) for row in rendered_rows))
-        for col in range(len(headers))
-    ]
-    header_line = "| " + " | ".join(
-        headers[col].ljust(widths[col]) for col in range(len(headers))
-    ) + " |"
-    sep_line = "| " + " | ".join("-" * widths[col] for col in range(len(headers))) + " |"
-    body = [
-        "| " + " | ".join(row[col].ljust(widths[col]) for col in range(len(headers))) + " |"
-        for row in rendered_rows
-    ]
-    return "\n".join([header_line, sep_line, *body])
-
-
-def _render_named_table(table: dict[str, Any]) -> str:
-    return _markdown_table(table["headers"], table["rows"])
-
-
-def build_comparison_tables(
-    metrics: dict[str, Any],
-    coeffs: dict[str, float],
-    truth: dict[str, Any] | None,
-) -> dict[str, dict[str, Any]]:
-    """基于校准指标，生成用于Markdown报告的各项性能对比表格数据。"""
-
-    stage_keys = [
-        ("raw", "Raw"),
-        ("after_intra", "After intra"),
-        ("after_full", "After full"),
-    ]
-    rms_by_stage = {
-        "raw": metrics.get("error_vs_ideal", {}).get("rms_raw_lsb"),
-        "after_intra": metrics.get("error_vs_ideal", {}).get("rms_after_intra_lsb"),
-        "after_full": metrics.get("error_vs_ideal", {}).get("rms_after_full_lsb"),
-    }
-    performance_rows = []
-    for key, label in stage_keys:
-        fft = metrics.get("fft", {}).get(key, {})
-        performance_rows.append(
-            [
-                label,
-                rms_by_stage.get(key),
-                fft.get("SNDR_dB"),
-                fft.get("SFDR_dBc_single_bin"),
-                fft.get("ENOB_bits"),
-            ]
-        )
-
-    coeff_meanings = {
-        "g20": "ch2 gain correction to ch0",
-        "o20": "ch2 offset correction to ch0 (LSB)",
-        "g31": "ch3 gain correction to ch1",
-        "o31": "ch3 offset correction to ch1 (LSB)",
-        "g_B": "B gain correction to A",
-        "o_B": "B offset correction to A (LSB)",
-        "k_B": "B timing-like coefficient",
-    }
-    coeff_rows = []
-    truth_compare = metrics.get("truth_compare", {})
-    for name in ("g20", "o20", "g31", "o31", "g_B", "o_B", "k_B"):
-        truth_row = truth_compare.get(name, {})
-        true_value = truth_row.get("true")
-        estimated = coeffs.get(name)
-        error = None if true_value is None or estimated is None else estimated - true_value
-        rel_error = None
-        if true_value is not None and true_value != 0 and error is not None:
-            rel_error = error / true_value * 100.0
-        coeff_rows.append(
-            [
-                name,
-                coeff_meanings[name],
-                true_value,
-                estimated,
-                error,
-                rel_error,
-            ]
-        )
-
-    reference_tracking = metrics.get("inter", {}).get("reference_tracking", {})
-    before = reference_tracking.get("rms_U_B_minus_Dhat_safe_before_lsb")
-    after = reference_tracking.get("rms_U_B_corr_minus_Dhat_safe_after_lsb")
-    reference_rows = [
-        [
-            "B stream vs A-predicted reference RMS on safe mask",
-            before,
-            after,
-            None if before in (None, 0) or after is None else before / after,
-        ]
-    ]
-    reference_vs_ideal = metrics.get("reference_vs_ideal", {}).get(
-        "rms_Dhat_B_minus_D_ideal_B_on_safe_lsb"
-    )
-    reference_rows.append(
-        [
-            "A-predicted B reference vs D_ideal_B RMS on safe mask",
-            reference_vs_ideal,
-            "-",
-            "-",
-        ]
-    )
-
-    injected_rows = []
-    if truth:
-        for ch in range(4):
-            injected_rows.append(
-                [
-                    f"ch{ch}",
-                    truth.get(f"g{ch}"),
-                    truth.get(f"o{ch}"),
-                ]
-            )
-        injected_rows.append(["noise", "-", truth.get("noise_std")])
-        injected_rows.append(["dt_mdac_A_ps", "-", float(truth.get("dt_mdac_A", 0.0)) * 1e12])
-        injected_rows.append(["dt_mdac_B_ps", "-", float(truth.get("dt_mdac_B", 0.0)) * 1e12])
-
-    ls_diag = metrics.get("inter", {}).get("diagnostics", {})
-    mask_counts = metrics.get("inter", {}).get("mask_counts", {})
-    ls_rows = [
-        ["safe samples", mask_counts.get("safe_after_reference")],
-        ["static samples", ls_diag.get("mask_static_count")],
-        ["rank_X", ls_diag.get("rank_X")],
-        ["cond_X", ls_diag.get("cond_X")],
-        ["corr_F_s", ls_diag.get("corr_F_s")],
-        ["rms_res_B_lsb", ls_diag.get("rms_res_B")],
-        ["corr_res_F", ls_diag.get("corr_res_F")],
-        ["corr_res_s", ls_diag.get("corr_res_s")],
-    ]
-    if ls_diag.get("adaptive_method") == "nlms":
-        ls_rows.extend(
-            [
-                ["adaptive method", ls_diag.get("adaptive_method")],
-                ["NLMS mu", ls_diag.get("lms_mu")],
-                ["NLMS epochs", ls_diag.get("lms_epochs")],
-                ["trace block size", ls_diag.get("lms_trace_block_size")],
-                ["settling ratio", ls_diag.get("lms_settling_ratio")],
-                ["safe samples per epoch", ls_diag.get("lms_safe_sample_count")],
-                ["total coefficient updates", ls_diag.get("lms_update_count")],
-                ["convergence reached", ls_diag.get("convergence_reached")],
-                ["convergence block count", ls_diag.get("convergence_block_count")],
-                ["convergence samples", ls_diag.get("convergence_samples")],
-                ["settling threshold RMS", ls_diag.get("settling_threshold_rms")],
-                ["RMS decay dB/sample", ls_diag.get("rms_decay_db_per_sample")],
-            ]
-        )
-
-    return {
-        "performance": {
-            "title": "Before/after performance comparison",
-            "headers": ["Stage", "RMS vs D_ideal (LSB)", "SNDR (dB)", "SFDR (dBc)", "ENOB (bit)"],
-            "rows": performance_rows,
-        },
-        "coefficients": {
-            "title": "Estimated correction coefficients vs injected truth",
-            "headers": ["Coeff", "Meaning", "True", "Estimated", "Error", "Rel err (%)"],
-            "rows": coeff_rows,
-        },
-        "reference_tracking": {
-            "title": "B-group reference tracking",
-            "headers": ["Metric", "Before", "After", "Improvement x"],
-            "rows": reference_rows,
-        },
-        "injected_mismatch": {
-            "title": "Raw injected mismatch parameters",
-            "headers": ["Item", "Injected gain", "Injected offset / value"],
-            "rows": injected_rows,
-        },
-        "ls_diagnostics": {
-            "title": "Inter-group calibration diagnostics",
-            "headers": ["Metric", "Value"],
-            "rows": ls_rows,
-        },
-    }
-
-
-def build_markdown_report(
-    stem: str,
-    coeffs: dict[str, float],
-    metrics: dict[str, Any],
-    files: dict[str, str],
-) -> str:
-    lines = [
-        f"# ADC Calibration Report: {stem}",
-        "",
-        "The coefficient truth values are correction coefficients derived from the injected channel mismatch.",
-        "For example, g20_true = g2 / g0 and g_B_true = g1 / g0.",
-        "",
-        "## Output Files",
-        "",
-        _markdown_table(["Artifact", "Path"], [[name, path] for name, path in files.items()]),
-        "",
-    ]
-    for key in (
-        "performance",
-        "coefficients",
-        "reference_tracking",
-        "injected_mismatch",
-        "ls_diagnostics",
-        "timing_mismatch",
-    ):
-        table = metrics.get("tables", {}).get(key)
-        if not table:
-            continue
-        lines.extend(
-            [
-                f"## {table['title']}",
-                "",
-                _render_named_table(table),
-                "",
-            ]
-        )
-    lines.extend(
-        [
-            "## Coefficients",
-            "",
-            _markdown_table(
-                ["Coeff", "Value"],
-                [[name, coeffs[name]] for name in ("g20", "o20", "g31", "o31", "g_B", "o_B", "k_B")],
-            ),
-            "",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def save_calibration_outputs(
-    output_dir: Path,
-    stem: str,
-    D_raw: Array,
-    D_corr: Array,
-    coeffs: dict[str, float],
-    debug: dict[str, Any],
-    metrics: dict[str, Any],
-) -> dict[str, str]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    npz_path = output_dir / f"{stem}_calibration.npz"
-    json_path = output_dir / f"{stem}_calibration_summary.json"
-    report_path = output_dir / f"{stem}_calibration_report.md"
-    np.savez_compressed(
-        npz_path,
-        D_raw=_as_float_array(D_raw),
-        D_after_intra=_as_float_array(debug["D_after_intra"]),
-        D_corr=_as_float_array(D_corr),
-        F_intra_corr=_as_float_array(debug["F_intra_corr"]),
-        Dhat_B=_as_float_array(debug["Dhat_B"]),
-        Fhat_B=_as_float_array(debug["Fhat_B"]),
-        s_B=_as_float_array(debug["s_B"]),
-        mask_safe=np.asarray(debug["mask_safe"], dtype=bool),
-        res_B=_as_float_array(debug["res_B"]),
-    )
-    json_path.write_text(
-        json.dumps(
-            _json_ready({"coeffs": coeffs, "metrics": metrics}),
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    files = {
-        "npz": str(npz_path),
-        "summary_json": str(json_path),
-        "report_md": str(report_path),
-    }
-    report_path.write_text(
-        build_markdown_report(stem, coeffs, metrics, files),
-        encoding="utf-8",
-    )
-    return files
-
-
-def print_report_tables(metrics: dict[str, Any]) -> None:
-    for key in ("performance", "coefficients", "reference_tracking", "ls_diagnostics"):
-        table = metrics.get("tables", {}).get(key)
-        if not table:
-            continue
-        print("")
-        print(table["title"])
-        print(_render_named_table(table))
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run layered ADC calibration on synthetic or saved data.",
-    )
-    parser.add_argument(
-        "input",
-        type=Path,
-        nargs="?",
-        default=None,
-        help="Optional .npz dataset from model.py. If omitted, a demo dataset is generated.",
-    )
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs") / "calibration")
-    parser.add_argument(
-        "--output-stem",
-        default=None,
-        help="Optional output filename stem. Defaults to the input/demo name.",
-    )
-    parser.add_argument("--N", type=int, default=2**16)
-    parser.add_argument("--fs", type=float, default=1.0e9)
-    parser.add_argument(
-        "--fin",
-        type=float,
-        default=None,
-        help="Demo tone in Hz. Defaults to tone_bin / N * fs.",
-    )
-    parser.add_argument("--tone-bin", type=int, default=4001)
-    parser.add_argument("--amplitude", type=float, default=511.0)
-    parser.add_argument("--phase", type=float, default=0.31)
-    parser.add_argument("--seed", type=int, default=20260614)
-    parser.add_argument(
-        "--timing-case",
-        choices=("case_0", "case_1", "case_2"),
-        default="case_0",
-    )
-    parser.add_argument(
-        "--dt-mdac-A-ps",
-        type=float,
-        default=None,
-        help="Override demo MDAC-A aperture skew in ps.",
-    )
-    parser.add_argument(
-        "--dt-mdac-B-ps",
-        type=float,
-        default=None,
-        help="Override demo MDAC-B aperture skew in ps.",
-    )
-    parser.add_argument(
-        "--reference-method",
-        choices=("linear", "fractional_delay_fir", "known_tone"),
-        default="known_tone",
-    )
-    parser.add_argument("--fir-taps", type=int, default=15)
-    parser.add_argument("--fine-safe-ratio", type=float, default=0.8)
-    parser.add_argument("--use-coarse-stable-mask", action="store_true")
-    parser.add_argument(
-        "--inter-method",
-        choices=("two_stage", "joint", "nlms"),
-        default="two_stage",
-    )
-    parser.add_argument(
-        "--known-tone-source",
-        choices=("A", "full"),
-        default="A",
-    )
-    parser.add_argument("--lms-mu", type=float, default=0.005)
-    parser.add_argument("--lms-epochs", type=int, default=1)
-    parser.add_argument("--lms-eps", type=float, default=1e-9)
-    parser.add_argument("--lms-trace-block-size", type=int, default=1024)
-    parser.add_argument("--lms-settling-ratio", type=float, default=1.1)
-    parser.add_argument("--no-fft", action="store_true")
-    parser.add_argument("--noise-std", type=float, default=0.08)
-    parser.add_argument("--g0", type=float, default=1.0)
-    parser.add_argument("--o0", type=float, default=0.0)
-    parser.add_argument("--g1", type=float, default=1.0)
-    parser.add_argument("--o1", type=float, default=0.0)
-    parser.add_argument("--g2", type=float, default=1.012)
-    parser.add_argument("--o2", type=float, default=-1.5)
-    parser.add_argument("--g3", type=float, default=0.988)
-    parser.add_argument("--o3", type=float, default=1.2)
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    if args.input is None:
-        data, truth = build_demo_dataset(args)
-        stem = f"demo_{args.timing_case}_{args.reference_method}"
-    else:
-        data, truth = load_npz_dataset(args.input)
-        stem = args.input.stem
-    if args.output_stem:
-        stem = args.output_stem
-
-    cfg = CalibrationConfig(
-        N_fine=8,
-        reference_method=args.reference_method,
-        fir_taps=args.fir_taps,
-        fine_safe_ratio=args.fine_safe_ratio,
-        use_coarse_stable_mask=bool(args.use_coarse_stable_mask),
-        inter_method=args.inter_method,
-        known_tone_source=args.known_tone_source,
-        lms_mu=args.lms_mu,
-        lms_epochs=args.lms_epochs,
-        lms_eps=args.lms_eps,
-        lms_trace_block_size=args.lms_trace_block_size,
-        lms_settling_ratio=args.lms_settling_ratio,
-    )
-    calibrator = calibrate_adc_background if cfg.inter_method == "nlms" else calibrate_adc
-    D_corr, coeffs, debug, metrics = calibrator(
-        data["D_coarse"],
-        data["F_raw"],
-        sar_id=data.get("sar_id"),
-        C_raw=data.get("C_raw"),
-        fs=float(data["fs"]) if "fs" in data else None,
-        fin=float(data["fin"]) if "fin" in data else None,
-        D_ideal=data.get("D_ideal"),
-        truth=truth,
-        config=cfg,
-    )
-    D_raw = _as_float_array(data["D_coarse"]) + _as_float_array(data["F_raw"])
-    if not args.no_fft and "fs" in data:
-        add_fft_metrics(
-            metrics,
-            D_raw,
-            debug["D_after_intra"],
-            D_corr,
-            fs=float(data["fs"]),
-            fin=float(data["fin"]) if "fin" in data else None,
-        )
-    metrics["tables"] = build_comparison_tables(metrics, coeffs, truth)
-
-    files = save_calibration_outputs(
-        args.output_dir,
-        stem,
-        D_raw,
-        D_corr,
-        coeffs,
-        debug,
-        metrics,
-    )
-
-    print("Layered ADC calibration complete.")
-    print(f"Reference method: {cfg.reference_method}")
-    print(f"Output NPZ: {files['npz']}")
-    print(f"Summary JSON: {files['summary_json']}")
-    print(f"Markdown report: {files['report_md']}")
-    print("Coefficients:")
-    for name in ("g20", "o20", "g31", "o31", "g_B", "o_B", "k_B"):
-        print(f"  {name}: {coeffs[name]:.8g}")
-    if "error_vs_ideal" in metrics:
-        e = metrics["error_vs_ideal"]
-        print("RMS error vs D_ideal:")
-        print(f"  raw:         {e['rms_raw_lsb']:.6g} LSB")
-        print(f"  after intra: {e['rms_after_intra_lsb']:.6g} LSB")
-        print(f"  after full:  {e['rms_after_full_lsb']:.6g} LSB")
-    if "fft" in metrics:
-        print("FFT SNDR / SFDR:")
-        for key in ("raw", "after_intra", "after_full"):
-            m = metrics["fft"][key]
-            print(
-                f"  {key:12s} SNDR={m['SNDR_dB']:.3f} dB, "
-                f"SFDR={m['SFDR_dBc_single_bin']:.3f} dBc"
-            )
-    print_report_tables(metrics)
-
-
-if __name__ == "__main__":
-    main()

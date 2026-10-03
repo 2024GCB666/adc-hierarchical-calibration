@@ -1,32 +1,15 @@
-"""ADC architecture model and synthetic data generator.
+"""Behavioral ADC model used by the paper validation scripts.
 
-This module implements the modeling-only part described in
-``ADC分层校准算法_架构建模与合成数据验证规格(2).md``.
-
-It intentionally does not implement calibration.  The output data preserves
-the ADC structure:
-
-    common 2.5-bit Flash/coarse path
-      -> dual-MDAC 2-way interleaving
-      -> four SAR backend channels
-      -> D_raw = D_coarse + F_raw
-
-Run:
-
-    python model.py
-
-The script writes a compressed NPZ, a CSV table, and a JSON summary under
-``outputs/`` by default.
+A common 2.5-effective-bit redundant coarse path feeds two MDAC groups and
+four backend SAR channels. The raw code is D_coarse + F_raw. Simulation
+records are generated in memory; no ADC output-code dataset is bundled.
 """
 
 from __future__ import annotations
 
-import argparse
-import csv
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -557,114 +540,8 @@ def _json_ready(obj: Any) -> Any:
     return obj
 
 
-def write_dataset_csv(data: dict[str, Any], csv_path: Path) -> None:
-    """Write the full row-wise dataset to CSV."""
-
-    columns = [
-        "n",
-        "sar_id",
-        "mdac_id",
-        "t_nominal",
-        "t_flash",
-        "t_mdac_group",
-        "t_mdac",
-        "dt_mdac_group",
-        "dt_sar",
-        "x_analog",
-        "x_flash",
-        "x_mdac",
-        "D_ideal",
-        "C_raw",
-        "D_DAC",
-        "D_coarse",
-        "mdac_residue_gain",
-        "V_residue",
-        "F_residue_input_referred",
-        "F_ideal",
-        "F_ideal_q",
-        "F_raw",
-        "D_raw",
-        "D_no_mismatch",
-        "slope_norm",
-        "F_raw_clipped",
-    ]
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(columns)
-        N = int(data["n"].size)
-        for i in range(N):
-            row = []
-            for col in columns:
-                value = data[col][i] if isinstance(data[col], np.ndarray) else data[col]
-                if isinstance(value, (float, np.floating)):
-                    row.append(f"{float(value):.12g}")
-                elif isinstance(value, (bool, np.bool_)):
-                    row.append(int(value))
-                else:
-                    row.append(value)
-            writer.writerow(row)
 
 
-def save_outputs(
-    data: dict[str, Any],
-    truth: dict[str, Any],
-    metrics: dict[str, Any],
-    output_dir: Path,
-    stem: str = "adc_synthetic_modeling_data",
-    write_csv: bool = True,
-) -> dict[str, str]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    npz_path = output_dir / f"{stem}.npz"
-    csv_path = output_dir / f"{stem}.csv"
-    json_path = output_dir / f"{stem}_summary.json"
-
-    array_payload = {
-        key: value for key, value in data.items() if isinstance(value, np.ndarray)
-    }
-    np.savez_compressed(
-        npz_path,
-        **array_payload,
-        fs=np.asarray(data["fs"]),
-        fin=np.asarray(data["fin"]),
-        truth_json=np.asarray(json.dumps(_json_ready(truth), ensure_ascii=False)),
-        metrics_json=np.asarray(json.dumps(_json_ready(metrics), ensure_ascii=False)),
-    )
-
-    files = {"npz": str(npz_path)}
-    if write_csv:
-        write_dataset_csv(data, csv_path)
-        files["csv"] = str(csv_path)
-
-    summary = {
-        "description": "Modeling-only synthetic ADC data; no calibration applied.",
-        "files": files,
-        "data_columns": {
-            "n": "global sample index",
-            "sar_id": "four-way SAR channel id, n % 4",
-            "mdac_id": "dual-MDAC id, n % 2",
-            "C_raw": "2.5-bit Flash raw state",
-            "D_DAC": "MDAC DAC feedback level in final-output LSB",
-            "D_coarse": "coarse contribution in final-output LSB",
-            "mdac_residue_gain": "MDAC residue gain; default is 4",
-            "V_residue": "MDAC output residue, residue_gain*(x_mdac - D_DAC)",
-            "F_residue_input_referred": "V_residue divided by residue_gain",
-            "F_ideal": "ideal input-referred fine residue before mismatch",
-            "F_raw": "signed 8-bit SAR fine code after mismatch/noise/quantization",
-            "D_raw": "raw reconstructed code, D_coarse + F_raw",
-            "D_ideal": "ideal full-rate code at the MDAC sampling instant",
-            "t_mdac_group": "MDAC A/B group sampling time that forms the residue",
-            "dt_mdac_group": "A/B MDAC aperture skew applied to this sample",
-            "dt_sar": "SAR timing metadata only; not applied to residue sampling",
-        },
-        "truth": truth,
-        "metrics": metrics,
-    }
-    json_path.write_text(
-        json.dumps(_json_ready(summary), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    files["summary_json"] = str(json_path)
-    return files
 
 
 def timing_case(case_name: str) -> TimingConfig:
@@ -688,118 +565,3 @@ def timing_case(case_name: str) -> TimingConfig:
     if case_name not in cases:
         raise ValueError(f"Unknown timing case {case_name!r}.")
     return cases[case_name]
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Generate modeling-only synthetic data for the ADC architecture.",
-    )
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
-    parser.add_argument(
-        "--prefix",
-        default="adc_synthetic_modeling_data",
-        help=(
-            "Fixed output prefix. The script writes "
-            "<prefix>_nomismatch.* and <prefix>_mismatch.*"
-        ),
-    )
-    parser.add_argument("--N", type=int, default=2**16)
-    parser.add_argument("--fs", type=float, default=1.0e9)
-    parser.add_argument("--fin", type=float, default=499e6)
-    parser.add_argument("--amplitude", type=float, default=511.0)
-    parser.add_argument("--phase", type=float, default=0.31)
-    parser.add_argument("--dc", type=float, default=0.0)
-    parser.add_argument("--seed", type=int, default=20260614)
-    parser.add_argument("--N-fine", type=int, default=8)
-    parser.add_argument(
-        "--timing-case",
-        choices=("case_0", "case_1", "case_2"),
-        default="case_2",
-        help="Timing case used for the mismatch dataset.",
-    )
-    parser.add_argument("--noise-std", type=float, default=0.08)
-    parser.add_argument(
-        "--no-csv",
-        action="store_true",
-        help="Only write NPZ and JSON summary.",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    signal = SignalConfig(
-        fs=args.fs,
-        fin=args.fin,
-        amplitude=args.amplitude,
-        phase=args.phase,
-        dc=args.dc,
-    )
-    ideal_mismatch = MismatchConfig(
-        g0=1.0,
-        o0=0.0,
-        g1=1.0,
-        o1=0.0,
-        g2=1.0,
-        o2=0.0,
-        g3=1.0,
-        o3=0.0,
-        noise_std=0.0,
-    )
-    common = dict(
-        N=args.N,
-        N_fine=args.N_fine,
-        seed=args.seed,
-        signal=signal,
-        mdac=MdacConfig(residue_gain=4.0),
-    )
-    jobs = [
-        (
-            "nomismatch",
-            DatasetConfig(
-                **common,
-                timing=timing_case("case_0"),
-                mismatch=ideal_mismatch,
-            ),
-        ),
-        (
-            "mismatch",
-            DatasetConfig(
-                **common,
-                timing=timing_case(args.timing_case),
-                mismatch=MismatchConfig(noise_std=args.noise_std),
-            ),
-        ),
-    ]
-
-    print("Synthetic ADC modeling data generated.")
-    for suffix, cfg in jobs:
-        data, truth, metrics = build_synthetic_adc_dataset(cfg)
-        files = save_outputs(
-            data,
-            truth,
-            metrics,
-            output_dir=args.output_dir,
-            stem=f"{args.prefix}_{suffix}",
-            write_csv=not args.no_csv,
-        )
-        print(f"\n[{suffix}]")
-        for name, path in files.items():
-            print(f"{name}: {path}")
-        print(
-            "Checks: "
-            f"sar_id=n%4 {metrics['model']['sar_id_is_n_mod_4']}, "
-            f"mdac_id=n%2 {metrics['model']['mdac_id_is_n_mod_2']}, "
-            "D_raw=D_coarse+F_raw "
-            f"{metrics['model']['D_raw_equals_D_coarse_plus_F_raw']}"
-        )
-        print(
-            "Fine clip ratio: "
-            f"{metrics['model']['fine_clip_ratio']:.6g}; "
-            "raw RMS error vs D_ideal: "
-            f"{metrics['error_vs_ideal']['rms_raw_lsb']:.6g} LSB"
-        )
-
-
-if __name__ == "__main__":
-    main()
